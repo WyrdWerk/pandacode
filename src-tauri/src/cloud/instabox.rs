@@ -31,6 +31,8 @@ const KEEP: u64 = 4 * 1024 * 1024;
 const PIECE: usize = 128 * 1024;
 /// The longest activity lease InstaBox grants, in seconds.
 const LEASE_MAX: u64 = 3600;
+/// PandaCode's lease on each machine (`PUT /machines/{id}/activity-leases/{lease}`).
+const LEASE: &str = "pandacode";
 const OPERATION_MAX: Duration = Duration::from_secs(600);
 const POLL: Duration = if cfg!(test) { Duration::from_millis(10) } else { Duration::from_secs(3) };
 
@@ -149,16 +151,18 @@ impl InstaBox {
         };
         if operation.is_null() { Ok(()) } else { self.settle(operation).await.map(|_| ()) }
     }
+    /// An activity lease (at most an hour; it wakes a paused machine first) holds off the idle
+    /// pause, and a full idle period starts when it expires. The idle pause itself changes
+    /// only for accounts with manual lifecycle: every other plan answers the PATCH with its
+    /// fixed 30 minutes, so the lease is always taken.
     async fn keep_alive(&self, id: &str, minutes: u32) -> Result<()> {
         self.owned(id).await?;
         let seconds = u64::from(minutes.max(1)) * 60;
-        let patched = self.call(reqwest::Method::PATCH, &format!("/machines/{id}"), Some(json!({"autoSuspendAfterSeconds": seconds})), Duration::from_secs(30)).await;
-        if patched.is_ok() {
-            return Ok(());
-        }
-        // Plans with a fixed idle pause refuse the PATCH; an activity lease holds it off instead.
-        let lease = json!({"machineId": id, "ttlSeconds": seconds.min(LEASE_MAX)});
-        self.call(reqwest::Method::PUT, &format!("/activity-leases/pandacode-{id}"), Some(lease), Duration::from_secs(30)).await.map(|_| ())
+        let lease = json!({"ttlSeconds": seconds.clamp(30, LEASE_MAX)});
+        self.call(reqwest::Method::PUT, &format!("/machines/{id}/activity-leases/{LEASE}"), Some(lease), Duration::from_secs(30)).await?;
+        // A key with only `machines:exec` may lease but not PATCH; the lease is what counts.
+        let _ = self.call(reqwest::Method::PATCH, &format!("/machines/{id}"), Some(json!({"autoSuspendAfterSeconds": seconds.clamp(120, 86_400)})), Duration::from_secs(30)).await;
+        Ok(())
     }
     /// One `exec` call; the reply's stdout, or None when InstaBox stopped it at `seconds`.
     async fn run(&self, id: &str, cmd: &str, stdin: Option<&str>, seconds: u64) -> Result<Option<String>> {
@@ -227,10 +231,10 @@ impl InstaBox {
 }
 
 impl Sandbox for InstaBox {
-    /// Suspended machines keep disk and memory. The free plan pauses after a fixed 30 idle
-    /// minutes, so promise no more than that.
+    /// Suspended machines keep disk and memory. The activity lease keeps one awake for up to
+    /// an hour; after it, InstaBox's idle pause applies.
     fn info(&self) -> Info {
-        Info { persistent: true, max_unattended_minutes: 30 }
+        Info { persistent: true, max_unattended_minutes: 60 }
     }
     fn list(&self) -> Result<Vec<Machine>> {
         http::block(InstaBox::list(self))
@@ -310,8 +314,9 @@ mod tests {
                 ("GET", "/v1/machines/m_9") => text(r#"{"id":"m_9","state":"running","metadata":{}}"#),
                 ("POST", "/v1/machines/m_2/resume") => (202, br#"{"id":"op_2","state":"succeeded"}"#.to_vec()),
                 ("DELETE", "/v1/machines/m_2") => (202, br#"{"id":"op_3","type":"delete","state":"failed","error":{"message":"busy"}}"#.to_vec()),
-                ("PATCH", "/v1/machines/m_1") => (403, br#"{"error":{"code":"plan","message":"not on this plan"}}"#.to_vec()),
-                ("PUT", "/v1/activity-leases/pandacode-m_1") => text("{}"),
+                // As live on the free plan: the PATCH succeeds but keeps the fixed 30 minutes.
+                ("PATCH", "/v1/machines/m_1") => text(r#"{"id":"m_1","autoSuspendAfterSeconds":1800}"#),
+                ("PUT", "/v1/machines/m_1/activity-leases/pandacode") => text(r#"{"id":"pandacode","machineId":"m_1","expiresAt":"2026-10-24T07:30:21Z"}"#),
                 ("POST", "/v1/machines/m_1/exec") if cmd.contains("tail -c +") => {
                     let number = |after: &str| cmd.split(after).nth(1).and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<usize>().ok()).unwrap();
                     let (start, max, all) = (number("tail -c +") - 1, number("head -c "), big());
@@ -339,18 +344,32 @@ mod tests {
         instabox.power("m_2", "start").await.unwrap();
         assert!(instabox.power("m_2", "delete").await.unwrap_err().contains("busy"));
         assert!(instabox.power("m_2", "pause").await.is_err());
-        instabox.keep_alive("m_1", 30).await.unwrap();
         let log = seen.lock().unwrap();
         assert_eq!(log.iter().filter(|r| r.path == "/v1/operations/op_1").count(), 2, "polled until it succeeded");
         assert!(log.iter().all(|r| r.headers.iter().any(|(n, v)| n == "x-api-key" && v == "ibk_k")));
         let keys: Vec<&str> = log.iter().filter(|r| r.method != "GET").map(|r| r.headers.iter().find(|(n, _)| n == "idempotency-key").map(|(_, v)| v.as_str()).expect("mutation without an Idempotency-Key")).collect();
-        assert_eq!(keys.len(), 5);
+        assert_eq!(keys.len(), 3);
         assert_eq!(keys.iter().collect::<std::collections::HashSet<_>>().len(), keys.len(), "each mutation gets its own key");
         assert!(log.iter().filter(|r| r.method == "GET").all(|r| !r.headers.iter().any(|(n, _)| n == "idempotency-key")));
         let create: Value = serde_json::from_str(&log.iter().find(|r| r.method == "POST" && r.path == "/v1/machines").unwrap().body).unwrap();
         assert_eq!(create, json!({"name": "pc-new", "templateId": "agent-browser", "metadata": {"created-by": "pandacode"}}));
-        let lease: Value = serde_json::from_str(&log.iter().find(|r| r.method == "PUT").unwrap().body).unwrap();
-        assert_eq!(lease, json!({"machineId": "m_1", "ttlSeconds": 1800}));
+    }
+
+    #[tokio::test]
+    async fn keep_alive_takes_the_machine_lease_even_when_the_idle_patch_succeeds() {
+        let (instabox, seen) = instabox();
+        instabox.keep_alive("m_1", 60).await.unwrap();
+        instabox.keep_alive("m_1", 15).await.unwrap();
+        // Over the hour InstaBox grants, the lease is capped.
+        instabox.keep_alive("m_1", 24 * 60).await.unwrap();
+        let log = seen.lock().unwrap();
+        let leases: Vec<Value> = log.iter().filter(|r| r.method == "PUT").map(|r| {
+            assert_eq!(r.path, "/v1/machines/m_1/activity-leases/pandacode");
+            serde_json::from_str(&r.body).unwrap()
+        }).collect();
+        assert_eq!(leases, vec![json!({"ttlSeconds": 3600}), json!({"ttlSeconds": 900}), json!({"ttlSeconds": 3600})]);
+        let idle: Vec<Value> = log.iter().filter(|r| r.method == "PATCH").map(|r| serde_json::from_str(&r.body).unwrap()).collect();
+        assert_eq!(idle, vec![json!({"autoSuspendAfterSeconds": 3600}), json!({"autoSuspendAfterSeconds": 900}), json!({"autoSuspendAfterSeconds": 86400})]);
     }
 
     #[tokio::test]
