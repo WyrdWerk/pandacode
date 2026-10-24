@@ -460,6 +460,65 @@ mod tests {
         assert!(log.iter().all(|r| r.method == "GET" && r.path == "/v1/machines/m_9"), "nothing else was sent");
     }
 
+    /// `INSTABOX_API_KEY=… cargo test --lib instabox_live -- --ignored --nocapture`. Creates
+    /// one agent-browser machine and always deletes it.
+    #[test]
+    #[ignore = "needs INSTABOX_API_KEY"]
+    fn instabox_live() {
+        let api = InstaBox::new(None, std::env::var("INSTABOX_API_KEY").expect("INSTABOX_API_KEY"));
+        let started = Instant::now();
+        let made = Sandbox::create(&api, &format!("pc-live-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])).unwrap();
+        let id = made.id.trim_start_matches("instabox:").to_string();
+        eprintln!("instabox_live: created {id} ({}) in {} s", made.detail, started.elapsed().as_secs());
+        let run = || -> Result<()> {
+            let wait_running = || -> Result<()> {
+                let started = Instant::now();
+                while Sandbox::state(&api, &id)? != "running" {
+                    assert!(started.elapsed() < Duration::from_secs(600), "never ran");
+                    std::thread::sleep(Duration::from_secs(3));
+                }
+                Ok(())
+            };
+            wait_running()?;
+            // The lease (the old /activity-leases path answered 404) and one watcher, however
+            // often keep_alive runs.
+            Sandbox::keep_alive(&api, &id, 60)?;
+            Sandbox::keep_alive(&api, &id, 60)?;
+            assert_eq!(Sandbox::exec(&api, &id, "pgrep -fc reconnect.sh", Duration::from_secs(30))?.1.trim(), "1", "one watcher only");
+            // Pause with an open HTTPS connection: after the resume it is closed, processes kept.
+            Sandbox::spawn(&api, &id, "exec sleep 3000")?;
+            let sleeper = "pgrep -x sleep -a | grep ' 3000$' | cut -d' ' -f1";
+            let (_, pid) = Sandbox::exec(&api, &id, sleeper, Duration::from_secs(30))?;
+            assert!(!pid.trim().is_empty(), "background process died");
+            Sandbox::spawn(&api, &id, "exec python3 -c 'import socket,ssl,time; s=ssl.create_default_context().wrap_socket(socket.create_connection((\"api.github.com\",443)),server_hostname=\"api.github.com\"); time.sleep(3600)'")?;
+            std::thread::sleep(Duration::from_secs(3));
+            let open = "ss -Htnp state established '( dport = :443 )' | grep -c python3";
+            assert_eq!(Sandbox::exec(&api, &id, open, Duration::from_secs(30))?.1.trim(), "1");
+            Sandbox::power(&api, &id, "stop")?;
+            assert_eq!(Sandbox::state(&api, &id)?, "stopped");
+            std::thread::sleep(Duration::from_secs(30));
+            Sandbox::power(&api, &id, "start")?;
+            wait_running()?;
+            std::thread::sleep(Duration::from_secs(12));
+            assert_eq!(Sandbox::exec(&api, &id, open, Duration::from_secs(30))?.1.trim(), "0", "stale connection left open");
+            assert_eq!(Sandbox::exec(&api, &id, sleeper, Duration::from_secs(30))?.1, pid, "processes were not kept across the pause");
+            eprintln!("instabox_live: all steps passed");
+            Ok(())
+        };
+        // Delete even when a step panics, and wait until InstaBox answers 404.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+        Sandbox::power(&api, &id, "delete").unwrap();
+        let deleted = Instant::now();
+        loop {
+            match http::block(api.get(&id)) {
+                Err(error) if error.contains("not found") => break eprintln!("instabox_live: {id} deleted, GET answers 404 ({error})"),
+                _ => assert!(deleted.elapsed() < Duration::from_secs(180), "{id} still exists"),
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        result.unwrap().unwrap();
+    }
+
     #[test]
     fn connect_refuses_empty_keys() {
         assert!(connect(" ", &json!({})).is_err());
